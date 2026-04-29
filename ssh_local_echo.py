@@ -36,6 +36,12 @@ FF = 0x0c
 BEL = 0x07
 OSC_OPEN = 0x5d  # ']'
 
+# Bytes that must NOT be bulk-inserted as data (each one has special handling).
+_CONTROL_BYTES = frozenset({CTRL_O, ESC, CR, LF, TAB, BS, DEL, ETX, EOT, SUB, FF})
+
+PASTE_START = b'\x1b[200~'
+PASTE_END = b'\x1b[201~'
+
 
 class Wrapper:
     def __init__(self, ssh_args, start_passthrough=False, filter_bel=True):
@@ -43,6 +49,8 @@ class Wrapper:
         self.passthrough = start_passthrough
         self.filter_bel = filter_bel
         self.buffer = bytearray()
+        self.cursor = 0              # position within buffer (0..len(buffer))
+        self.line_server_owned = False  # True when current line is server-managed
         self.expected_echo = bytearray()
         self.master_fd = -1
         self.child_pid = -1
@@ -179,7 +187,6 @@ class Wrapper:
                 continue
 
             if self.passthrough:
-                # Bulk-write up to the next CTRL_O or end of buffer.
                 j = i
                 while j < n and data[j] != CTRL_O:
                     j += 1
@@ -187,85 +194,272 @@ class Wrapper:
                 i = j
                 continue
 
-            # --- buffered mode ---
-            if b == ESC:
-                seq, consumed = _consume_escape(data, i)
-                # Arrows / function keys / etc: server-side handling.
-                # Erase any locally-buffered prefix so display doesn't conflict
-                # with whatever the server redraws (history navigation, etc.).
-                self._send_immediate(seq, stdout_fd, erase_buffer=True)
-                i += consumed
-                continue
+            if self.line_server_owned:
+                i = self._handle_input_server_owned(data, i)
+            else:
+                i = self._handle_input_buffered(data, i, stdout_fd)
 
-            if b in (CR, LF):
-                self._send_with_buffer(b'\r', stdout_fd, local_echo=b'\r\n')
-                i += 1
-                continue
+    # --- Buffered (buffer-owned) input ---------------------------------
 
-            if b == TAB:
-                # Send buffer + tab, let server's completion output land
-                # on screen unmodified. Local buffer cleared; server now owns
-                # the line state until next Enter.
-                self._send_with_buffer(b'\t', stdout_fd, local_echo=b'')
-                i += 1
-                continue
+    def _handle_input_buffered(self, data, i, stdout_fd):
+        n = len(data)
+        b = data[i]
 
-            if b in (BS, DEL):
-                if self.buffer:
-                    self.buffer.pop()
-                    os.write(stdout_fd, b'\b \b')
-                else:
-                    # Local buffer empty: line state is owned by the server
-                    # (e.g. after Tab completion or just-after-Enter). Forward
-                    # the backspace so bash readline erases its own buffer.
-                    os.write(self.master_fd, b'\x7f')
-                i += 1
-                continue
+        if b == ESC:
+            seq, consumed = _consume_escape(data, i)
+            self._handle_escape_seq(seq, stdout_fd)
+            return i + consumed
 
-            if b == ETX:
-                self._send_immediate(b'\x03', stdout_fd, erase_buffer=True)
-                i += 1
-                continue
+        if b in (CR, LF):
+            # Submit line; next line starts buffer-owned again.
+            self._send_with_buffer(b'\r', stdout_fd, local_echo=b'\r\n')
+            return i + 1
 
-            if b == SUB:
-                self._send_immediate(b'\x1a', stdout_fd, erase_buffer=True)
-                i += 1
-                continue
+        if b == TAB:
+            # Server now owns line state (its readline has the completed line).
+            self._send_with_buffer(b'\t', stdout_fd, local_echo=b'')
+            self.line_server_owned = True
+            return i + 1
 
-            if b == EOT:
-                # Send accumulated buffer + EOT so server sees the typed line.
-                # Empty buffer → bare EOT (logout in bash).
-                self._send_with_buffer(b'\x04', stdout_fd, local_echo=b'')
-                i += 1
-                continue
+        if b in (BS, DEL):
+            self._handle_backspace(stdout_fd)
+            return i + 1
 
-            if b == FF:
-                # Clear-screen: forward without touching local buffer.
-                # The visible buffer prefix may briefly be redrawn by the
-                # server; if it isn't, the user can press Backspace through
-                # their buffer or just press Enter.
-                os.write(self.master_fd, b'\x0c')
-                i += 1
-                continue
+        if b == ETX:
+            self._send_immediate(b'\x03', stdout_fd, erase_buffer=True)
+            return i + 1
 
-            # Printable / data byte: append + local echo
-            self.buffer.append(b)
-            os.write(stdout_fd, bytes((b,)))
-            i += 1
+        if b == SUB:
+            self._send_immediate(b'\x1a', stdout_fd, erase_buffer=True)
+            return i + 1
+
+        if b == EOT:
+            self._send_with_buffer(b'\x04', stdout_fd, local_echo=b'')
+            return i + 1
+
+        if b == FF:
+            self.buffer.clear()
+            self.cursor = 0
+            os.write(self.master_fd, b'\x0c')
+            return i + 1
+
+        # Run of printable / data bytes — bulk-insert in one render.
+        j = i
+        while j < n and data[j] not in _CONTROL_BYTES:
+            j += 1
+        self._insert_run_at_cursor(bytes(data[i:j]), stdout_fd)
+        return j
+
+    # --- Server-owned input --------------------------------------------
+
+    def _handle_input_server_owned(self, data, i):
+        """Forward keystrokes to the server while the line is server-managed.
+
+        No local echo: bash readline echoes back through the master PTY.
+        This costs latency (one roundtrip per char) but is correct when the
+        line content includes server-rendered text we don't track (history
+        entries, tab-completed text, pasted content).
+        """
+        n = len(data)
+        b = data[i]
+
+        if b == ESC:
+            seq, consumed = _consume_escape(data, i)
+            os.write(self.master_fd, seq)
+            return i + consumed
+
+        if b in (CR, LF):
+            os.write(self.master_fd, b'\r')
+            self.line_server_owned = False
+            self.expected_echo.clear()
+            return i + 1
+
+        if b in (ETX, SUB, EOT):
+            os.write(self.master_fd, bytes((b,)))
+            self.line_server_owned = False
+            self.expected_echo.clear()
+            return i + 1
+
+        if b == FF:
+            os.write(self.master_fd, b'\x0c')
+            return i + 1  # Ctrl-L doesn't reset readline state
+
+        if b in (BS, DEL):
+            os.write(self.master_fd, b'\x7f')
+            return i + 1
+
+        if b == TAB:
+            os.write(self.master_fd, b'\t')
+            return i + 1
+
+        # Bulk-forward run of printable bytes to the server.
+        j = i
+        while j < n and data[j] not in _CONTROL_BYTES:
+            j += 1
+        os.write(self.master_fd, bytes(data[i:j]))
+        return j
+
+    # --- Local line editor -----------------------------------------------
+
+    def _insert_run_at_cursor(self, run, stdout_fd):
+        """Insert a run of bytes at the cursor with a single redraw.
+
+        Used both for normal typing (one byte) and for pastes (many bytes).
+        """
+        if not run:
+            return
+        self.buffer[self.cursor:self.cursor] = run
+        self.cursor += len(run)
+        rest = bytes(self.buffer[self.cursor:])
+        out = run + rest
+        if rest:
+            out += b'\x1b[%dD' % len(rest)
+        os.write(stdout_fd, out)
+
+    def _handle_backspace(self, stdout_fd):
+        if self.cursor > 0:
+            self.cursor -= 1
+            del self.buffer[self.cursor]
+            rest = bytes(self.buffer[self.cursor:])
+            out = b'\b' + rest + b' '
+            out += b'\x1b[%dD' % (len(rest) + 1)
+            os.write(stdout_fd, out)
+        elif not self.buffer:
+            # Buffer empty (e.g. after Tab or fresh prompt): forward to
+            # server so its readline erases its own buffer.
+            os.write(self.master_fd, b'\x7f')
+        # cursor==0 and non-empty buffer: at start of input — no-op.
+
+    def _delete_at_cursor(self, stdout_fd):
+        """Forward-delete at cursor (DEL key, ESC[3~)."""
+        if self.cursor < len(self.buffer):
+            del self.buffer[self.cursor]
+            rest = bytes(self.buffer[self.cursor:])
+            out = rest + b' '
+            out += b'\x1b[%dD' % (len(rest) + 1)
+            os.write(stdout_fd, out)
+        elif not self.buffer:
+            os.write(self.master_fd, b'\x1b[3~')
+
+    def _move_left(self, stdout_fd):
+        if self.cursor > 0:
+            self.cursor -= 1
+            os.write(stdout_fd, b'\b')
+        elif not self.buffer:
+            os.write(self.master_fd, b'\x1b[D')
+
+    def _move_right(self, stdout_fd):
+        if self.cursor < len(self.buffer):
+            os.write(stdout_fd, bytes((self.buffer[self.cursor],)))
+            self.cursor += 1
+        elif not self.buffer:
+            os.write(self.master_fd, b'\x1b[C')
+
+    def _move_home(self, stdout_fd):
+        if self.cursor > 0:
+            os.write(stdout_fd, b'\b' * self.cursor)
+            self.cursor = 0
+        elif not self.buffer:
+            os.write(self.master_fd, b'\x1b[H')
+
+    def _move_end(self, stdout_fd):
+        if self.cursor < len(self.buffer):
+            os.write(stdout_fd, bytes(self.buffer[self.cursor:]))
+            self.cursor = len(self.buffer)
+        elif not self.buffer:
+            os.write(self.master_fd, b'\x1b[F')
+
+    def _erase_buffer_visual(self, stdout_fd):
+        """Visually erase the buffer from screen and reset state."""
+        if not self.buffer:
+            return
+        rest = bytes(self.buffer[self.cursor:])
+        out = bytearray()
+        if rest:
+            out += rest  # advance display cursor to end of buffer
+        out += b'\b \b' * len(self.buffer)
+        os.write(stdout_fd, bytes(out))
+        self.buffer.clear()
+        self.cursor = 0
+
+    def _handle_escape_seq(self, seq, stdout_fd):
+        """Dispatch an ANSI escape sequence (buffer-owned mode only)."""
+        # Local cursor movement
+        if seq in (b'\x1b[D', b'\x1bOD'):
+            self._move_left(stdout_fd)
+            return
+        if seq in (b'\x1b[C', b'\x1bOC'):
+            self._move_right(stdout_fd)
+            return
+        if seq in (b'\x1b[H', b'\x1bOH', b'\x1b[1~', b'\x1b[7~'):
+            self._move_home(stdout_fd)
+            return
+        if seq in (b'\x1b[F', b'\x1bOF', b'\x1b[4~', b'\x1b[8~'):
+            self._move_end(stdout_fd)
+            return
+        if seq == b'\x1b[3~':
+            self._delete_at_cursor(stdout_fd)
+            return
+        if seq == PASTE_START:
+            # Bracketed paste begins. Commit our buffer first so the paste
+            # appends to whatever the user already typed, then forward the
+            # marker and let the server own the line.
+            self._commit_buffer_to_server(stdout_fd)
+            os.write(self.master_fd, seq)
+            self.line_server_owned = True
+            return
+        # Up/Down history, F-keys, paste-end-while-buffer-owned (rare),
+        # or any unrecognized sequence: erase local buffer (the displayed
+        # line is about to be replaced or augmented by the server) and
+        # forward, then mark the line server-owned.
+        self._erase_buffer_visual(stdout_fd)
+        os.write(self.master_fd, seq)
+        self.line_server_owned = True
+
+    def _commit_buffer_to_server(self, stdout_fd):
+        """Send the local buffer to the server with echo tracking.
+
+        Used when an action needs to preserve typed input (e.g. paste,
+        which appends to the existing line) rather than discard it.
+        """
+        if not self.buffer:
+            return
+        rest = bytes(self.buffer[self.cursor:])
+        if rest:
+            os.write(stdout_fd, rest)
+            self.cursor = len(self.buffer)
+        send = bytes(self.buffer)
+        self.expected_echo += send
+        os.write(self.master_fd, send)
+        self.buffer.clear()
+        self.cursor = 0
+
+    # --- Sending the buffer ----------------------------------------------
 
     def _send_with_buffer(self, suffix, stdout_fd, local_echo):
+        # If cursor is mid-buffer, advance display cursor to end so what the
+        # user sees matches what we're about to commit.
+        rest = bytes(self.buffer[self.cursor:])
+        if rest:
+            os.write(stdout_fd, rest)
+            self.cursor = len(self.buffer)
         send = bytes(self.buffer) + suffix
         self.expected_echo += send
         os.write(self.master_fd, send)
         self.buffer.clear()
+        self.cursor = 0
         if local_echo:
             os.write(stdout_fd, local_echo)
+        # Caller decides whether to flip line_server_owned (Enter resets it,
+        # Tab sets it).
 
     def _send_immediate(self, payload, stdout_fd, erase_buffer):
-        if erase_buffer and self.buffer:
-            os.write(stdout_fd, b'\b \b' * len(self.buffer))
-            self.buffer.clear()
+        if erase_buffer:
+            self._erase_buffer_visual(stdout_fd)
         os.write(self.master_fd, payload)
+        # Ctrl-C / Ctrl-Z reset the line: server shows a fresh prompt.
+        self.line_server_owned = False
+        self.expected_echo.clear()
 
     # --- Output handling ------------------------------------------------
 
@@ -379,14 +573,14 @@ class Wrapper:
         self.passthrough = not self.passthrough
         if self.passthrough:
             label = b'\r\n[ssh-local-echo: passthrough]\r\n'
-            # Flush any locally-buffered chars to screen as a hint, but
-            # don't send them — user toggled to raw mode mid-typing.
-            if self.buffer:
-                os.write(stdout_fd, b'\b \b' * len(self.buffer))
-                self.buffer.clear()
+            self._erase_buffer_visual(stdout_fd)
         else:
             label = b'\r\n[ssh-local-echo: buffered]\r\n'
             self.expected_echo.clear()
+            # Coming back from passthrough: assume line is server-owned
+            # (we don't know what state was left). User pressing Enter
+            # transitions back to buffer-owned.
+            self.line_server_owned = True
         os.write(stdout_fd, label)
 
 

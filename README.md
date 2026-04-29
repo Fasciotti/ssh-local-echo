@@ -23,20 +23,37 @@ chmod +x ssh_local_echo.py
 python3 ssh_local_echo.py user@host
 ```
 
-## Comportamento por tecla (modo `buffered`, padrão)
+## Modos de operação
 
-| Tecla            | Ação                                                                 |
-|------------------|----------------------------------------------------------------------|
-| Letras/símbolos  | Echo local + acumula no buffer (NÃO envia)                           |
-| Backspace        | Apaga do buffer local se não vazio. Se vazio (pós-Tab/pós-Enter), encaminha pro servidor |
-| Enter            | Envia buffer + `\r` ao servidor, limpa buffer, suprime echo de volta |
-| Tab              | Envia buffer + `\t`, limpa buffer, deixa servidor exibir completion  |
-| Ctrl-C           | Limpa buffer visualmente, envia `\x03`                               |
-| Ctrl-D           | Envia buffer + `\x04`                                                |
-| Ctrl-Z           | Limpa buffer visualmente, envia `\x1a`                               |
-| Ctrl-L           | Envia `\x0c` (limpa tela), buffer preservado                         |
-| Setas / F-keys   | Limpa buffer visualmente, envia sequência de escape                  |
-| **Ctrl-O**       | Alterna entre `buffered` e `passthrough`                             |
+O modo principal `buffered` opera em duas sub-fases automáticas:
+
+### `buffer-owned` (digitação fresca)
+
+Estado padrão depois de Enter, Ctrl-C, Ctrl-Z, Ctrl-D ou Ctrl-L. Você está digitando uma linha nova:
+
+| Tecla              | Ação                                                                 |
+|--------------------|----------------------------------------------------------------------|
+| Letras/símbolos    | Echo local + insert no buffer (NÃO envia até trigger)                |
+| Backspace          | Apaga char à esquerda do cursor com redraw da cauda                  |
+| Delete (`Esc[3~`)  | Apaga char na posição do cursor                                       |
+| Setas ←/→          | Move cursor dentro do buffer **localmente** (sem latência)            |
+| Home / End         | Vai pro início / fim do buffer **localmente**                         |
+| Enter              | Envia buffer + `\r`, suprime echo de volta, próxima linha buffer-owned |
+| Tab                | Envia buffer + `\t`, transição → server-owned                         |
+| Setas ↑/↓          | Commit visual do buffer + envia, transição → server-owned (history)  |
+| Ctrl-C / Ctrl-Z    | Apaga buffer + envia signal, próxima linha buffer-owned              |
+| Ctrl-D             | Envia buffer + `\x04`                                                 |
+| Ctrl-L             | Limpa tela (server) + reset buffer local                              |
+| **Ctrl-O**         | Alterna pra `passthrough`                                             |
+| Paste `Esc[200~..` | Commit do buffer ao servidor, transição → server-owned               |
+
+### `server-owned` (linha gerenciada pelo servidor)
+
+Estado depois de Tab, history (↑/↓) ou paste. A linha é renderizada e mantida pelo `readline` do servidor — o wrapper **não tem** o conteúdo dela.
+
+Nesse estado, **toda tecla é forwardada pro servidor** sem echo local (você sente latência da rede). Isso é necessário porque o display tem texto que o wrapper não conhece — fazer insert local sobreposicionaria caracteres existentes.
+
+A transição de volta pra `buffer-owned` é automática em: Enter, Ctrl-C, Ctrl-D, Ctrl-Z (qualquer evento que produza um prompt fresco).
 
 ### Modo `passthrough`
 
@@ -76,13 +93,15 @@ Quando enviamos `cd Documents\r`, registramos isso como `expected_echo`. Quando 
 
 - **Senhas dentro da sessão SSH**: se um comando remoto pedir senha (`sudo`, `passwd`, etc.), os caracteres digitados aparecerão no seu terminal local. **Use Ctrl-O pra entrar em passthrough antes de digitar a senha.** A própria autenticação inicial do `ssh` também tem esse problema; se for autenticação por senha, conecte primeiro em passthrough (`--passthrough`) ou prefira chave SSH.
 
-- **Backspace pós-Tab**: depois de uma completion, o buffer local está vazio e o backspace é encaminhado ao servidor (que apaga via `readline`). Funciona, mas vai sentir uma latência igual ao SSH cru *só* nesses backspaces; os backspaces dos chars que você digitou *após* a completion ainda são instantâneos (apagados localmente).
+- **Latência durante history/paste/pós-Tab**: nesses casos a linha é server-owned e cada tecla custa um roundtrip — voltando à experiência do SSH cru. A próxima linha (após Enter / Ctrl-C) é buffer-owned de novo e volta ao echo local instantâneo.
 
-- **Histórico do shell (setas ↑/↓)**: as setas são tratadas server-side. O wrapper limpa o buffer local visualmente antes de enviar a seta — o servidor então redesenha a linha do histórico. Funciona, mas você perde o que tava digitando localmente.
+- **Histórico (↑/↓)**: limpa o que você tava digitando localmente — assim como o `readline` faria sem o wrapper.
 
 - **Aplicações fullscreen**: detecção automática de modo raw não está implementada. Use Ctrl-O pra entrar/sair de passthrough manualmente quando abrir/fechar `vim`, `less`, etc.
 
-- **Multibyte / UTF-8**: chars multibyte funcionam pro envio, mas o backspace local apaga *um byte* do buffer, não um *codepoint*. Apagar um caractere acentuado pode exigir múltiplos backspaces e pode bagunçar o display momentaneamente.
+- **Multibyte / UTF-8**: chars multibyte funcionam pro envio, mas backspace e cursor movement operam em *bytes*, não *codepoints*. Apagar um caractere acentuado pode exigir múltiplos backspaces e o display pode ficar momentaneamente desalinhado.
+
+- **Linhas que ultrapassam a largura do terminal**: o redraw mid-line usa ANSI cursor moves que podem se comportar inconsistentemente após wrap. Pra linhas longas, prefira pressionar Enter e dividir em comandos menores.
 
 ## Teste rápido
 
@@ -103,10 +122,12 @@ ssh-local-echo/
 ├── LICENSE                   # MIT
 ├── .gitignore
 └── tests/
-    ├── test_units.py         # testes unitários das funções puras
-    ├── drive_test.py         # E2E contra bandit0 (login + comandos)
-    ├── probe_tab.py          # captura bytes do servidor após Tab
-    └── probe_backspace.py    # verifica forwarding de backspace pós-Tab
+    ├── test_units.py            # testes unitários das funções puras
+    ├── drive_test.py            # E2E contra bandit0 (login + comandos)
+    ├── probe_tab.py             # captura bytes do servidor após Tab
+    ├── probe_backspace.py       # verifica forwarding de backspace pós-Tab
+    ├── probe_arrows.py          # cursor mid-line (Left/Right/Home/End)
+    └── probe_history_paste.py   # history nav, edit pós-history, paste
 ```
 
 ## Testes
